@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
       - name: demo-app
-        image: your-dockerhub-username/demo-app:latest
+        image: oge1ata/demo-app:latest
         ports:
         - containerPort: 8000
 ---

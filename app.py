@@ -8,4 +8,4 @@ def health():
 
 @app.get("/")
 def root():
-    return {"message": "hello"}
+    return {"message": "hello from the CI/CD pipeline"}

@@ -19,6 +19,13 @@ spec:
         image: oge1ata/demo-app:11ceb80d1fa3a4e9577d3bd90ba3b17f987c5217
         ports:
         - containerPort: 8000
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
 ---
 apiVersion: v1
 kind: Service

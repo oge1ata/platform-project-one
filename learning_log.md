@@ -73,3 +73,67 @@ Where I am in the overall journey
 - Write a README explaining the architecture for the portfolio
 - Add resource requests/limits to deployment.yaml
 - Swap the `kubectl port-forward` for a proper Ingress if I want the ArgoCD UI reachable without a manual command each time
+
+---
+
+# Project 2 — Understanding What I Built
+
+## 2026-08-30 — Exercise 1.1 (Pod scheduling) — but it turned into Exercise 2.2 first
+
+**What I did:** Ran `kubectl scale deployment demo-app --replicas=3 -n default` directly against the cluster to see where the new pods would land.
+
+**What I observed:** Two of the three pods went `Terminating` within about 20 seconds of being created — the deployment settled back down to 1 pod almost immediately, undoing my scale command.
+
+**Why it happened:** I hadn't touched Git at all — `kubectl scale` only changes the *live* cluster, not the desired state recorded in `k8s/deployment.yaml` (which still said `replicas: 1`). ArgoCD continuously polls the repo and compares it against the live cluster; since ArgoCD's `syncPolicy.automated.selfHeal` is turned on, it treated my manual change as drift and reverted it back to match Git. First checked my guess that it was a resource limit problem — but the pods showed `Terminating`, not `Pending`, which was the tell that something *actively killed* them rather than Kubernetes failing to schedule them.
+
+**What surprised me:** I ran head-first into Exercise 2.2 (self-healing) by accident while trying to do Exercise 1.1 (scheduling). Good reminder that in a real GitOps setup, `kubectl` changes made directly against the cluster don't stick — Git is the actual source of truth, not whatever's currently running.
+
+## 2026-08-30 — Bonus lesson: pull before you push
+
+**What I did:** After confirming the self-heal theory, edited `k8s/deployment.yaml` myself to set `replicas: 3`, committed, and tried to push.
+
+**What I observed:** `git push` was rejected — "Updates were rejected because the remote contains work that you do not have locally." Diverged branches.
+
+**Why it happened:** My last push before this was days ago. When that push landed, GitHub Actions ran and committed its own change back to `k8s/deployment.yaml` (updating the image tag) — a commit that only exists on GitHub, since I never pulled it down locally. So my new local commit was built on an outdated base. Ran `git pull --no-rebase` to merge both histories — since the CI commit only touched the `image:` line and mine only touched `replicas:`, Git merged them with zero conflicts.
+
+**What surprised me:** The CI pipeline committing back to the repo isn't a one-time thing that only matters right after I set it up — it means my local clone can silently fall behind GitHub *every single time the pipeline runs*, not just when I personally push. Worth remembering to `git pull` before starting new work, not just before pushing.
+
+## 2026-08-30 — Exercise 1.1 (Pod scheduling) — for real this time
+
+**What I did:** Pushed the `replicas: 3` change to Git properly this time, then forced an ArgoCD refresh instead of waiting for its poll interval.
+
+**What I observed:** All 3 pods came up and stayed `Running` (no more `Terminating`). Placement: 2 pods on `k8s-worker2`, 1 pod on `k8s-worker1` — not a perfectly even split.
+
+**Why it happened:** This time the change came through Git, so ArgoCD saw it as the new desired state and applied it instead of reverting it. The uneven placement is the scheduler doing its normal job — it picks nodes based on available resources and a scoring algorithm, not a strict round-robin. With no anti-affinity rules or topology spread constraints set on this deployment, there's nothing forcing it to spread pods evenly across nodes — it's free to put more than one pod on the same node if that node scores best.
+
+**What surprised me:** How much more convincing this is as a live demo than reading about it — watching the exact same command produce a "wait what" result the first time (self-heal reverted it) and a "yes that's expected" result the second time (Git-driven change stuck), back to back, on the same cluster.
+
+## 2026-09-01 — Exercise 1.2 (Self-healing)
+
+**What I did:** Deleted one running pod directly with `kubectl delete pod` and watched with `kubectl get pods -w` to see what happened next.
+
+**What I observed:** A replacement pod started almost immediately — nowhere near the few-minutes delay ArgoCD would take.
+
+**Why it happened:** This isn't ArgoCD at all. Deployments actually work through a small hierarchy: **Deployment → ReplicaSet → Pods**. The ReplicaSet is the object that holds "there should be exactly N pods matching this spec," and a dedicated Kubernetes controller (the ReplicaSet controller, running inside kube-controller-manager) watches that continuously and creates a replacement the instant the count drops — completely independent of Git or ArgoCD. The speed was the actual evidence: ArgoCD polls every few minutes, this was near-instant, so it had to be a different, faster, always-on mechanism.
+
+**What surprised me:** There are two separate self-healing systems stacked on top of each other in this setup, operating at completely different layers and speeds — the ReplicaSet controller keeps the *pod count* correct in real time, while ArgoCD keeps the *whole cluster* matching Git every few minutes. Exercise 1.1's accidental detour and this exercise are really the same lesson from two different angles: something is always watching, but which "something" depends on what changed.
+
+## 2026-09-01 — Exercise 1.3 (Node failure simulation)
+
+**What I did:** Ran `multipass stop k8s-worker1` to kill an entire worker VM while 3 app pods were running, then watched `kubectl get nodes` and `kubectl get pods -o wide -n default` at the same time.
+
+**What I observed:** Two separate, very different timers. `k8s-worker1` flipped from `Ready` to `NotReady` in under a minute. But the pod that had been running on it (`5hmfv`) kept showing `Running` for several more minutes after that — the AGE just kept ticking — before it finally flipped to `Terminating`, and only then did a brand new pod get created (`Pending` → `ContainerCreating` → `Running`) on `k8s-worker2`. The old pod stayed stuck in `Terminating` limbo even after that. Once I ran `multipass start k8s-worker1` and it came back, the stuck pod cleared on its own with no manual force-delete needed — but none of the 3 running pods moved back to it. All 3 stayed piled up on `k8s-worker2`, leaving `k8s-worker1` completely empty despite being healthy again.
+
+**Why it happened:** Node failure detection is a two-stage process, not one event. Stage 1: the control plane marks a node `NotReady` once it stops hearing heartbeats — fast, tens of seconds. Stage 2: it waits a separate, much longer grace period (default 5 minutes) before actually evicting the pods that were on it. That gap is deliberate — a `NotReady` node might just be a brief network blip that resolves itself, and rescheduling pods instantly on every blip would cause unnecessary churn across a real cluster. The pod staying stuck in `Terminating` makes sense too: the API server can't confirm a pod is actually gone until the kubelet running on that pod's node acknowledges it — and that kubelet was unreachable, because the whole VM was down. And the fact that nothing moved back to `k8s-worker1` once it recovered is because Kubernetes only makes placement decisions when a pod is *created* — it never rebalances pods that are already running just because a better node becomes available. To prove this, deleted one of the pods piled on `k8s-worker2` manually, and its replacement landed on `k8s-worker1` — because deleting it forced a brand new scheduling decision, and with `k8s-worker1` empty, the scheduler's default spread-across-nodes preference kicked in.
+
+**What surprised me:** That recovery isn't symmetric with failure. A node going down and a node coming back sound like they should be mirror-image events, but they're not — going down triggers an active, timed response (detect → wait → evict → reschedule), while coming back triggers almost nothing on its own. The cluster just quietly accepts the node is available again and waits for some future scheduling decision to actually use it. If I hadn't forced that by deleting a pod, `k8s-worker1` could have sat empty indefinitely.
+
+## 2026-09-22 — Unplanned lesson: kernel settings don't survive a reboot
+
+**What I did:** Came back to the cluster after about 3 weeks away and found 3 app pods stuck — two `Unknown`, one stuck in `ContainerCreating` for 21 days straight.
+
+**What I observed:** Flannel's pods on both worker nodes were in `CrashLoopBackOff` with thousands of restarts. Their logs showed `Failed to check br_netfilter: stat /proc/sys/net/bridge/bridge-nf-call-iptables: no such file or directory`. The `br_netfilter` kernel module was missing on both workers (confirmed with `lsmod`), even though it was present on `k8s-control`.
+
+**Why it happened:** Back in Project 1 setup, I loaded `br_netfilter` with `sudo modprobe br_netfilter` and set the related settings with `echo 1 | sudo tee /proc/sys/net/...`. Neither of those is persistent — they only last until the next reboot. Sometime in the 3 weeks since we last touched this, the worker VMs restarted (most likely the Mac Mini sleeping or restarting), the module unloaded, and Flannel couldn't function without it. That cascaded into every app pod on the affected nodes failing to get network sandboxes at all. Fixed it properly this time: reloaded the module, but also added it to `/etc/modules-load.d/k8s.conf` (loads automatically on every boot from now on) and moved the sysctl settings into `/etc/sysctl.d/k8s.conf` instead of the one-off `/proc` writes.
+
+**What surprised me:** This wasn't caused by anything I did in Project 2 — it was a latent problem from Project 1's setup that had been sitting there the whole time, waiting for the first reboot to expose it. A "one-time setup command" and a "permanent setting" look identical the moment you type them, but behave completely differently the next time the machine restarts. Also a good reminder that "it worked when I set it up" and "it's actually configured correctly" aren't the same claim.

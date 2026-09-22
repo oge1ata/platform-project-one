@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
       - name: demo-app
-        image: oge1ata/demo-app:202efa27e93ffcfd5d410c3eed27fda985accc17
+        image: oge1ata/demo-app:f6220de02b5cb7a9192f1d3be30506d790685f1a
         ports:
         - containerPort: 8000
         resources:
